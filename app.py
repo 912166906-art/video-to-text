@@ -9,6 +9,9 @@ import socket
 
 import streamlit as st
 import yt_dlp
+from opencc import OpenCC
+
+converter = OpenCC("t2s")
 
 st.set_page_config(page_title="网页视频转文字助手", page_icon="🎬", layout="centered")
 
@@ -204,6 +207,8 @@ if st.button('开始提取', type='primary', use_container_width=True):
             if not segments:
                 st.warning('未检测到可识别的语音或字幕。')
             else:
+                # 统一转换为简体中文，确保网页和导出文件一致。
+                segments = [(s, e, converter.convert(t)) for s, e, t in segments]
                 transcript = '\n'.join(f'[{fmt_clock(s)}] {t}' for s,e,t in segments)
                 srt = '\n\n'.join(f'{i}\n{fmt_srt_time(s)} --> {fmt_srt_time(e)}\n{t}' for i,(s,e,t) in enumerate(segments,1))
                 st.session_state['result'] = (title,source,transcript,srt,len(segments))

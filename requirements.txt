@@ -2,3 +2,4 @@ streamlit>=1.40,<2
 yt-dlp>=2025.1.1
 faster-whisper==1.2.1
 av==17.1.0
+opencc-python-reimplemented>=0.1.7,<1
