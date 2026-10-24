@@ -18,6 +18,35 @@ st.set_page_config(page_title="网页视频转文字助手", page_icon="🎬", l
 MAX_DURATION = 45 * 60
 MAX_FILE_MB = 350
 
+# 只执行经过确认的常见错字替换；不应采用大范围的自动词替换。
+SAFE_TERMS = {"后补车票": "候补车票", "后补购票": "候补购票", "后补订单": "候补订单", "后补成功": "候补成功", "后补功能": "候补功能", "后补票": "候补票"}
+
+def glossary_correction(segments, topic, glossary):
+    # 新闻行业默认词典：只对高度明确的铁路购票语境修正。
+    is_rail = any(word in (topic + ' ' + glossary) for word in ('铁路', '购票', '车票', '高铁', '12306', '候补'))
+    mapping = SAFE_TERMS if is_rail else {}
+    extra = []
+    for row in glossary.splitlines():
+        if '=>' in row:
+            a, b = (x.strip() for x in row.split('=>', 1))
+            if a and b and len(a) < 40 and len(b) < 40:
+                extra.append((a,b))
+    results = []
+    for start,end,txt in segments:
+        new = txt
+        for bad,good in mapping.items():
+            new = new.replace(bad,good)
+        for bad,good in extra:
+            new = new.replace(bad,good)
+        results.append((start,end,new))
+    return results
+
+
+def build_outputs(segments):
+    transcript = '\n'.join(f'[{fmt_clock(s)}] {t}' for s,e,t in segments)
+    srt = '\n\n'.join(f'{i}\n{fmt_srt_time(s)} --> {fmt_srt_time(e)}\n{t}' for i,(s,e,t) in enumerate(segments,1))
+    return transcript,srt
+
 
 
 def valid_public_url(url: str):
@@ -233,7 +262,7 @@ def transcribe(path, lang, status):
     if _whisper_model is None:
         _whisper_model = WhisperModel('small', device='cpu', compute_type='int8')
     code = 'zh' if lang == '中文' else 'en' if lang == 'English' else None
-    segments, _ = _whisper_model.transcribe(str(path), language=code, vad_filter=True, beam_size=3)
+    segments, _ = _whisper_model.transcribe(str(path), language=code, vad_filter=True, beam_size=3, initial_prompt=st.session_state.get('asr_prompt') or None)
     return [(seg.start,seg.end,seg.text.strip()) for seg in segments if seg.text.strip()]
 
 def from_upload(file, lang, status, workdir):
@@ -255,6 +284,13 @@ st.caption('自动尝试不同链接格式，优先获取字幕；无字幕则�
 url = st.text_input('视频网页链接', placeholder='https://example.com/video')
 uploaded = st.file_uploader('或上传视频 / 音频文件（上传文件优先）', type=['mp4','mov','mkv','webm','mp3','wav','m4a','aac','flac'])
 lang = st.selectbox('识别语言', ['中文', 'English', '自动识别'])
+st.subheader('语境辅助与逐字稿校对')
+topic = st.text_input('视频主题（推荐填写）', placeholder='例如：国庆返程高峰，铁路12306候补购票')
+glossary = st.text_area('专业词汇 / 自定义纠错词典（选填）', placeholder='候补购票、12306、长沙南站\n后补车票 => 候补车票', height=92, help='每行一条错误 => 正确，可按你核实过的新闻术语配置。')
+mode = st.radio('校对方式', ['免费术语校对', '仅转写'], horizontal=True, index=0)
+st.caption('完全免费，无需API密钥。主题用于提示语音识别和限定部分校对规则；可在词典里按“错误 => 正确”添加确定的纠错规则。')
+# ASR 可参考已知术语；此设置有时能改善专名识别，但并不保证正确。
+st.session_state['asr_prompt'] = ('本新闻涉及：' + topic + '。术语：' + glossary.replace('=>','应为'))[:450] if (topic or glossary) else ''
 if st.button('开始提取', type='primary', use_container_width=True):
     if not url.strip() and uploaded is None:
         st.warning('请粘贴链接或上传文件。')
@@ -278,9 +314,11 @@ if st.button('开始提取', type='primary', use_container_width=True):
             else:
                 # 统一转换为简体中文，确保网页和导出文件一致。
                 segments = [(s, e, converter.convert(t)) for s, e, t in segments]
-                transcript = '\n'.join(f'[{fmt_clock(s)}] {t}' for s,e,t in segments)
-                srt = '\n\n'.join(f'{i}\n{fmt_srt_time(s)} --> {fmt_srt_time(e)}\n{t}' for i,(s,e,t) in enumerate(segments,1))
-                st.session_state['result'] = (title,source,transcript,srt,len(segments))
+                st.session_state['result'] = (title, source, segments)
+                st.session_state['corrected'] = None
+                st.session_state['result_topic'] = topic
+                st.session_state['result_glossary'] = glossary
+                st.session_state['result_mode'] = mode
         except Exception as exc:
             status_area.empty()
             st.error('处理失败：' + user_error(exc) if not isinstance(exc, ValueError) else '处理失败：' + str(exc)[:500])
@@ -288,12 +326,38 @@ if st.button('开始提取', type='primary', use_container_width=True):
                 st.code(str(exc)[:1500])
             st.info('备用方案：如果你有权访问该素材，可以将视频或音频文件下载到电脑，再使用上方“上传文件”功能。')
 if 'result' in st.session_state:
-    title,source,transcript,srt,count = st.session_state['result']
-    st.success(f'完成：{title}｜{source}｜共 {count} 段')
-    st.text_area('带时间码的逐字稿（可选中复制）', transcript, height=400)
-    col1,col2=st.columns(2)
-    with col1:
-        st.download_button('下载 TXT', transcript.encode('utf-8-sig'), 'transcript.txt', mime='text/plain', use_container_width=True)
-    with col2:
-        st.download_button('下载 SRT', srt.encode('utf-8-sig'), 'subtitles.srt', mime='text/plain', use_container_width=True)
-st.info('只能处理有权访问的资源。部分平台的登录、地域限制、DRM或反爬措施仍可能导致链接失败；上传授权文件是备用办法。免费云服务器不适合并发处理大量长视频。')
+    title,source,original = st.session_state['result']
+    original_txt, original_srt = build_outputs(original)
+    st.success(f'完成：{title}｜{source}｜共 {len(original)} 段')
+    if st.session_state.get('corrected') is None and st.session_state.get('result_mode') != '仅转写':
+        if st.button('根据视频主题进行校对', type='primary'):
+            try:
+                with st.spinner('正在校对并保留原稿...'):
+                    corrected = glossary_correction(original, st.session_state['result_topic'], st.session_state['result_glossary'])
+                    st.session_state['corrected'] = corrected
+            except Exception as exc:
+                st.error('校对未完成，原始转写稿未受影响。')
+                with st.expander('查看错误详情'):
+                    st.code(str(exc)[:1000])
+    corrected = st.session_state.get('corrected')
+    if corrected is not None:
+        corrected_txt, corrected_srt = build_outputs(corrected)
+        changes = [(fmt_clock(s), a[2], b[2]) for (s,*_),a,b in zip(original,original,corrected) if a[2] != b[2]]
+        st.subheader('校对结果（人工核对后使用）')
+        st.text_area('校对后逐字稿', corrected_txt, height=350)
+        st.caption(f'共 {len(changes)} 个分段发生变化。时间码保留原样；请对照原音频核实。')
+        if changes:
+            with st.expander('逐条查看修改前后对比'):
+                for clock, old, new in changes:
+                    st.write(f'**[{clock}]**')
+                    st.write('原文：' + old)
+                    st.write('校对：' + new)
+        left,right=st.columns(2)
+        left.download_button('下载校对稿 TXT',corrected_txt.encode('utf-8-sig'),'corrected.txt',mime='text/plain',use_container_width=True)
+        right.download_button('下载校对稿 SRT',corrected_srt.encode('utf-8-sig'),'corrected.srt',mime='text/plain',use_container_width=True)
+    with st.expander('查看原始识别稿（永久保留）', expanded=corrected is None):
+        st.text_area('未校对原文',original_txt,height=300)
+        left,right=st.columns(2)
+        left.download_button('原稿 TXT',original_txt.encode('utf-8-sig'),'original.txt',mime='text/plain',use_container_width=True)
+        right.download_button('原稿 SRT',original_srt.encode('utf-8-sig'),'original.srt',mime='text/plain',use_container_width=True)
+st.info('本工具无需付费API。免费术语校对是基于上下文触发的已知词汇纠错，并非能理解任意语义的大模型。新闻同期务必对照原音频核实人名、数字、引语。')
