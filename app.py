@@ -21,25 +21,28 @@ MAX_FILE_MB = 350
 # 只执行经过确认的常见错字替换；不应采用大范围的自动词替换。
 SAFE_TERMS = {"后补车票": "候补车票", "后补购票": "候补购票", "后补订单": "候补订单", "后补成功": "候补成功", "后补功能": "候补功能", "后补票": "候补票"}
 
-def glossary_correction(segments, topic, glossary):
-    # 新闻行业默认词典：只对高度明确的铁路购票语境修正。
-    is_rail = any(word in (topic + ' ' + glossary) for word in ('铁路', '购票', '车票', '高铁', '12306', '候补'))
-    mapping = SAFE_TERMS if is_rail else {}
-    extra = []
-    for row in glossary.splitlines():
-        if '=>' in row:
-            a, b = (x.strip() for x in row.split('=>', 1))
-            if a and b and len(a) < 40 and len(b) < 40:
-                extra.append((a,b))
-    results = []
-    for start,end,txt in segments:
-        new = txt
-        for bad,good in mapping.items():
-            new = new.replace(bad,good)
-        for bad,good in extra:
-            new = new.replace(bad,good)
-        results.append((start,end,new))
-    return results
+def auto_proofread(segments):
+    """Conservative, no-API edits: narrow term corrections only in proven contexts.
+
+    This is not generative proofreading. The original is retained separately.
+    """
+    joined = ' '.join(t for _, _, t in segments)
+    rail_context = any(word in joined for word in ('铁路', '12306', '高铁', '车票', '火车票', '列车', '购票', '候补'))
+    corrections = {
+        '后补购票': '候补购票',
+        '后补车票': '候补车票',
+        '后补订单': '候补订单',
+        '后补成功': '候补成功',
+        '后补功能': '候补功能',
+        '后补票': '候补票',
+    } if rail_context else {}
+    reviewed = []
+    for start, end, text in segments:
+        fixed = text
+        for typo, correct in corrections.items():
+            fixed = fixed.replace(typo, correct)
+        reviewed.append((start, end, fixed))
+    return reviewed
 
 
 def build_outputs(segments):
@@ -262,7 +265,7 @@ def transcribe(path, lang, status):
     if _whisper_model is None:
         _whisper_model = WhisperModel('small', device='cpu', compute_type='int8')
     code = 'zh' if lang == '中文' else 'en' if lang == 'English' else None
-    segments, _ = _whisper_model.transcribe(str(path), language=code, vad_filter=True, beam_size=3, initial_prompt=st.session_state.get('asr_prompt') or None)
+    segments, _ = _whisper_model.transcribe(str(path), language=code, vad_filter=True, beam_size=3)
     return [(seg.start,seg.end,seg.text.strip()) for seg in segments if seg.text.strip()]
 
 def from_upload(file, lang, status, workdir):
@@ -280,17 +283,10 @@ def from_upload(file, lang, status, workdir):
 
 
 st.title('🎬 网页视频转文字助手')
-st.caption('自动尝试不同链接格式，优先获取字幕；无字幕则进行 AI 语音转写。支持简体中文 TXT / SRT 导出。')
+st.caption('粘贴链接或上传文件，一键提取字幕、识别语音并自动校对。支持简体中文 TXT / SRT 导出。')
 url = st.text_input('视频网页链接', placeholder='https://example.com/video')
 uploaded = st.file_uploader('或上传视频 / 音频文件（上传文件优先）', type=['mp4','mov','mkv','webm','mp3','wav','m4a','aac','flac'])
 lang = st.selectbox('识别语言', ['中文', 'English', '自动识别'])
-st.subheader('语境辅助与逐字稿校对')
-topic = st.text_input('视频主题（推荐填写）', placeholder='例如：国庆返程高峰，铁路12306候补购票')
-glossary = st.text_area('专业词汇 / 自定义纠错词典（选填）', placeholder='候补购票、12306、长沙南站\n后补车票 => 候补车票', height=92, help='每行一条错误 => 正确，可按你核实过的新闻术语配置。')
-mode = st.radio('校对方式', ['免费术语校对', '仅转写'], horizontal=True, index=0)
-st.caption('完全免费，无需API密钥。主题用于提示语音识别和限定部分校对规则；可在词典里按“错误 => 正确”添加确定的纠错规则。')
-# ASR 可参考已知术语；此设置有时能改善专名识别，但并不保证正确。
-st.session_state['asr_prompt'] = ('本新闻涉及：' + topic + '。术语：' + glossary.replace('=>','应为'))[:450] if (topic or glossary) else ''
 if st.button('开始提取', type='primary', use_container_width=True):
     if not url.strip() and uploaded is None:
         st.warning('请粘贴链接或上传文件。')
@@ -315,10 +311,8 @@ if st.button('开始提取', type='primary', use_container_width=True):
                 # 统一转换为简体中文，确保网页和导出文件一致。
                 segments = [(s, e, converter.convert(t)) for s, e, t in segments]
                 st.session_state['result'] = (title, source, segments)
-                st.session_state['corrected'] = None
-                st.session_state['result_topic'] = topic
-                st.session_state['result_glossary'] = glossary
-                st.session_state['result_mode'] = mode
+                st.session_state['corrected'] = auto_proofread(segments)
+
         except Exception as exc:
             status_area.empty()
             st.error('处理失败：' + user_error(exc) if not isinstance(exc, ValueError) else '处理失败：' + str(exc)[:500])
@@ -329,35 +323,23 @@ if 'result' in st.session_state:
     title,source,original = st.session_state['result']
     original_txt, original_srt = build_outputs(original)
     st.success(f'完成：{title}｜{source}｜共 {len(original)} 段')
-    if st.session_state.get('corrected') is None and st.session_state.get('result_mode') != '仅转写':
-        if st.button('根据视频主题进行校对', type='primary'):
-            try:
-                with st.spinner('正在校对并保留原稿...'):
-                    corrected = glossary_correction(original, st.session_state['result_topic'], st.session_state['result_glossary'])
-                    st.session_state['corrected'] = corrected
-            except Exception as exc:
-                st.error('校对未完成，原始转写稿未受影响。')
-                with st.expander('查看错误详情'):
-                    st.code(str(exc)[:1000])
     corrected = st.session_state.get('corrected')
     if corrected is not None:
         corrected_txt, corrected_srt = build_outputs(corrected)
-        changes = [(fmt_clock(s), a[2], b[2]) for (s,*_),a,b in zip(original,original,corrected) if a[2] != b[2]]
-        st.subheader('校对结果（人工核对后使用）')
-        st.text_area('校对后逐字稿', corrected_txt, height=350)
-        st.caption(f'共 {len(changes)} 个分段发生变化。时间码保留原样；请对照原音频核实。')
+        changes = [(fmt_clock(a[0]), a[2], b[2]) for a, b in zip(original, corrected) if a[2] != b[2]]
+        st.text_area('逐字稿（简体中文 · 已自动校对）', corrected_txt, height=350)
+        left, right = st.columns(2)
+        left.download_button('下载 TXT', corrected_txt.encode('utf-8-sig'), 'transcript.txt', mime='text/plain', use_container_width=True)
+        right.download_button('下载 SRT', corrected_srt.encode('utf-8-sig'), 'subtitles.srt', mime='text/plain', use_container_width=True)
         if changes:
-            with st.expander('逐条查看修改前后对比'):
+            with st.expander(f'查看自动校对修改（{len(changes)}处）'):
                 for clock, old, new in changes:
                     st.write(f'**[{clock}]**')
                     st.write('原文：' + old)
                     st.write('校对：' + new)
-        left,right=st.columns(2)
-        left.download_button('下载校对稿 TXT',corrected_txt.encode('utf-8-sig'),'corrected.txt',mime='text/plain',use_container_width=True)
-        right.download_button('下载校对稿 SRT',corrected_srt.encode('utf-8-sig'),'corrected.srt',mime='text/plain',use_container_width=True)
     with st.expander('查看原始识别稿（永久保留）', expanded=corrected is None):
         st.text_area('未校对原文',original_txt,height=300)
         left,right=st.columns(2)
         left.download_button('原稿 TXT',original_txt.encode('utf-8-sig'),'original.txt',mime='text/plain',use_container_width=True)
         right.download_button('原稿 SRT',original_srt.encode('utf-8-sig'),'original.srt',mime='text/plain',use_container_width=True)
-st.info('本工具无需付费API。免费术语校对是基于上下文触发的已知词汇纠错，并非能理解任意语义的大模型。新闻同期务必对照原音频核实人名、数字、引语。')
+st.caption('免费自动校对仅修正常见且语境明确的术语；不会自动纠正所有语义错误。采访原话、人名和数据请对照原视频核实。')
