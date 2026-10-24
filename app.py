@@ -3,7 +3,7 @@ import json
 import tempfile
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import ipaddress
 import socket
 
@@ -35,6 +35,77 @@ def valid_public_url(url: str):
     except socket.gaierror:
         raise ValueError('无法解析网址域名。')
     return url
+
+
+
+def url_candidates(original):
+    """Try public, recognizable URLs. Never fabricate authenticated access."""
+    original = valid_public_url(original)
+    parsed = urlparse(original)
+    host = (parsed.hostname or '').lower()
+    options = [original]
+
+    # Tracking query parameters are often unnecessary on a playback URL.
+    tracking = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_content',
+                'utm_term', 'from', 'share', 'share_source', 'spm',
+                'externalsource', 'tc', 'dc', 'f', 'to'}
+    from urllib.parse import parse_qsl, urlencode
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    kept = [(k, v) for k, v in pairs if k.lower() not in tracking]
+    if len(kept) < len(pairs):
+        options.append(urlunparse(parsed._replace(query=urlencode(kept))))
+
+    # MGTV's /l/{show}/{video}.html share format can also have a /b/ page.
+    # Candidate only, NOT an assurance that the address exists.
+    if host in ('m.mgtv.com', 'www.mgtv.com', 'mgtv.com'):
+        match = re.fullmatch(r'/l/(\d+)/(\d+)\.html', parsed.path)
+        if match:
+            options.append(f'https://www.mgtv.com/b/{match.group(1)}/{match.group(2)}.html')
+        if host == 'm.mgtv.com' and parsed.path.startswith('/b/'):
+            options.append(urlunparse(parsed._replace(netloc='www.mgtv.com', query='')))
+
+    unique = []
+    for candidate in options:
+        if candidate not in unique:
+            valid_public_url(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def user_error(exc):
+    msg = str(exc)
+    lower = msg.lower()
+    if 'unsupported url' in lower or 'no suitable' in lower:
+        return '当前网站或链接格式不受解析器支持。可尝试视频网站的正式播放页，或者上传你有权使用的视频文件。'
+    if '403' in lower or 'forbidden' in lower or 'blocked' in lower:
+        return '视频平台拒绝了云服务器的访问（403）。换地址通常无效；可以尝试官方提供的可访问链接或上传授权文件。'
+    if any(word in lower for word in ('sign in','login','cookies','authentication','private video')):
+        return '该视频需要登录或访问授权。公共云服务器无法直接使用你浏览器里的登录状态。'
+    if any(word in lower for word in ('drm','protected content','encrypted')):
+        return '该视频可能受 DRM 加密保护，工具不会尝试绕过保护。'
+    if 'requested format is not available' in lower:
+        return '未找到可以提取的音视频格式；已尝试自动选择可用格式。'
+    if 'timed out' in lower or 'timeout' in lower:
+        return '网站连接超时，请确认链接可在浏览器打开，或稍后重新尝试。'
+    return '当前链接未能完成处理。可尝试上传已获授权的视频或音频文件。'
+
+
+def find_video_info(url, workdir, status):
+    options = url_candidates(url)
+    reasons = []
+    for index, candidate in enumerate(options, 1):
+        status(f'正在尝试解析地址（第 {index}/{len(options)} 种格式）...')
+        try:
+            with yt_dlp.YoutubeDL({**ydl_base(workdir), 'skip_download': True,
+                                  'ignoreerrors': False, 'cachedir': False}) as ydl:
+                info = ydl.extract_info(candidate, download=False)
+            if info and info.get('_type') != 'playlist':
+                return candidate, info
+            reasons.append('未找到独立视频')
+        except Exception as exc:
+            reasons.append(str(exc)[:350])
+    reason = user_error(' | '.join(reasons))
+    raise ValueError(reason + f'（已尝试 {len(options)} 种链接格式）')
 
 def fmt_srt_time(sec):
     sec = max(0, float(sec))
@@ -117,9 +188,7 @@ def ydl_base(workdir):
     return dict(paths={'home':str(workdir)}, noplaylist=True, quiet=True, no_warnings=True, socket_timeout=15, retries=2, fragment_retries=2, restrictfilenames=True)
 
 def from_url(url, lang, status, workdir):
-    url = valid_public_url(url)
-    with yt_dlp.YoutubeDL({**ydl_base(workdir), 'skip_download':True, 'ignoreerrors':False}) as ydl:
-        info = ydl.extract_info(url, download=False)
+    url, info = find_video_info(url, workdir, status)
     if not info: raise ValueError('无法读取此链接；部分平台需要登录、限制了访问或使用DRM。')
     duration = info.get('duration')
     if duration and duration > MAX_DURATION:
@@ -182,7 +251,7 @@ def from_upload(file, lang, status, workdir):
 
 
 st.title('🎬 网页视频转文字助手')
-st.caption('优先读取网页已有字幕；若没有字幕，则提取音频并由 AI 转写。支持 TXT / SRT 导出。')
+st.caption('自动尝试不同链接格式，优先获取字幕；无字幕则进行 AI 语音转写。支持简体中文 TXT / SRT 导出。')
 url = st.text_input('视频网页链接', placeholder='https://example.com/video')
 uploaded = st.file_uploader('或上传视频 / 音频文件（上传文件优先）', type=['mp4','mov','mkv','webm','mp3','wav','m4a','aac','flac'])
 lang = st.selectbox('识别语言', ['中文', 'English', '自动识别'])
@@ -214,7 +283,10 @@ if st.button('开始提取', type='primary', use_container_width=True):
                 st.session_state['result'] = (title,source,transcript,srt,len(segments))
         except Exception as exc:
             status_area.empty()
-            st.error('处理失败：' + str(exc)[:500])
+            st.error('处理失败：' + user_error(exc) if not isinstance(exc, ValueError) else '处理失败：' + str(exc)[:500])
+            with st.expander('查看技术错误（用于反馈问题）'):
+                st.code(str(exc)[:1500])
+            st.info('备用方案：如果你有权访问该素材，可以将视频或音频文件下载到电脑，再使用上方“上传文件”功能。')
 if 'result' in st.session_state:
     title,source,transcript,srt,count = st.session_state['result']
     st.success(f'完成：{title}｜{source}｜共 {count} 段')
@@ -224,4 +296,4 @@ if 'result' in st.session_state:
         st.download_button('下载 TXT', transcript.encode('utf-8-sig'), 'transcript.txt', mime='text/plain', use_container_width=True)
     with col2:
         st.download_button('下载 SRT', srt.encode('utf-8-sig'), 'subtitles.srt', mime='text/plain', use_container_width=True)
-st.info('只能处理你有权访问的资源。登录限制、DRM保护、平台反爬可能使链接提取失败。云服务器可能因资源不足无法完成长视频转写。')
+st.info('只能处理有权访问的资源。部分平台的登录、地域限制、DRM或反爬措施仍可能导致链接失败；上传授权文件是备用办法。免费云服务器不适合并发处理大量长视频。')
